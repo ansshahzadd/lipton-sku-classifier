@@ -62,12 +62,14 @@ The frontend (`npm run dev` in the repo root) expects this at
 ## Run on Colab GPU (no local GPU needed)
 
 If your machine has no GPU and the cascade is too slow to test locally, `colab_run.ipynb` runs
-this backend on a free Colab GPU runtime and exposes it over a Cloudflare tunnel, so your local
-frontend can point `VITE_API_BASE` at it instead of `localhost:8000`. Open the notebook in
-Colab, follow the one-time setup note in its first cell (uploading `models/`/`data/` to Google
-Drive, since those are gitignored), and run all cells — the last one prints the tunnel URL to
-paste into `frontend/.env`. `OCR_DEVICE=gpu` and a `paddlepaddle-gpu` install are handled by the
-notebook so the OCR stage gets the GPU speedup too, not just detection/embedding.
+this backend on a free Colab GPU runtime and exposes it over an ngrok tunnel (Cloudflare's free
+quick tunnel force-closes requests after ~100s, which a slow multi-crop upload can exceed), so
+your local frontend can point `VITE_API_BASE` at it instead of `localhost:8000`. Open the
+notebook in Colab, follow the one-time setup notes in its first cell (Google Drive for
+`models/`/`data/`, a Hugging Face token for the gated DINOv3 model, an ngrok authtoken), and run
+all cells — the last one prints the tunnel URL to paste into `frontend/.env`. `OCR_DEVICE=gpu`
+and a `paddlepaddle-gpu` install are handled by the notebook so the OCR stage gets the GPU
+speedup too, not just detection/embedding.
 
 ## Endpoints
 
