@@ -64,10 +64,11 @@ DINOV3_MODEL_ID = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 EMBED_DIM = 768
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # How many crops to run through the DINOv3 backbone in a single forward pass. Not a guide
-# setting -- purely a throughput knob (higher = fewer, bigger batches; lower = safer on
-# limited GPU memory). A shelf photo's crops are batched in chunks of this size rather than
-# one at a time.
-EMBED_BATCH_SIZE = 32
+# setting -- purely a throughput knob. None = every crop from a shelf photo goes through in
+# one single forward pass (maximum GPU utilization per call, at the cost of needing enough
+# GPU memory to hold the whole batch's activations at once); set to an int to chunk instead
+# if that ever OOMs on a smaller GPU.
+EMBED_BATCH_SIZE = None
 
 # ---- Crop geometry ("exact recognition crop parity") -----------------------
 PAD_FRAC = 0.03
@@ -97,10 +98,10 @@ OCR_REC_MODEL_NAME_EN = "en_PP-OCRv5_mobile_rec"
 OCR_REC_MODEL_NAME_AR = "arabic_PP-OCRv5_mobile_rec"
 
 OCR_DEVICE = os.environ.get("OCR_DEVICE", "cpu")
-# How many crops to send to PaddleOCR's predict() in a single call. Not a guide setting --
-# same throughput/memory tradeoff as EMBED_BATCH_SIZE above, sized smaller since the OCR
-# models (server detector + recognizer) are heavier per-image than the DINOv3 backbone.
-OCR_BATCH_SIZE = 16
+# How many crops to send to PaddleOCR's predict() in a single call. None = every qualifying
+# crop goes through in one call, same as EMBED_BATCH_SIZE above; set to an int to chunk
+# instead if that ever OOMs (the OCR server detector is heavier per-image than DINOv3).
+OCR_BATCH_SIZE = None
 
 OCR_ENABLE_MKLDNN = False
 if not OCR_ENABLE_MKLDNN:
@@ -390,9 +391,10 @@ def embed_crops_batch(crop_paths, processor, model, batch_size=EMBED_BATCH_SIZE)
     embed_crop, this just amortizes the Python/CUDA call overhead and lets the GPU actually
     process several crops in parallel. Returns a list of L2-normalized (EMBED_DIM,) float64
     arrays, one per crop_path, in the same order."""
+    step = batch_size if batch_size else len(crop_paths)
     embeddings = []
-    for start in range(0, len(crop_paths), batch_size):
-        batch_paths = crop_paths[start:start + batch_size]
+    for start in range(0, len(crop_paths), step):
+        batch_paths = crop_paths[start:start + step]
         images = [Image.open(p).convert("RGB") for p in batch_paths]
         inputs = processor(images=images, return_tensors="pt")
         inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
@@ -566,9 +568,10 @@ def _run_ocr_variant_batch(arrays, ocr_model, batch_size=OCR_BATCH_SIZE):
     return)."""
     if not arrays:
         return []
+    step = batch_size if batch_size else len(arrays)
     texts = []
-    for start in range(0, len(arrays), batch_size):
-        chunk = arrays[start:start + batch_size]
+    for start in range(0, len(arrays), step):
+        chunk = arrays[start:start + step]
         results = list(ocr_model.predict(chunk))
         if len(results) != len(chunk):
             raise RuntimeError(
