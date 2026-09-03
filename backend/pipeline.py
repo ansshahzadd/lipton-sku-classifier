@@ -62,6 +62,11 @@ DET_MAX_DET = 1000
 DINOV3_MODEL_ID = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 EMBED_DIM = 768
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# How many crops to run through the DINOv3 backbone in a single forward pass. Not a guide
+# setting -- purely a throughput knob (higher = fewer, bigger batches; lower = safer on
+# limited GPU memory). A shelf photo's crops are batched in chunks of this size rather than
+# one at a time.
+EMBED_BATCH_SIZE = 32
 
 # ---- Crop geometry ("exact recognition crop parity") -----------------------
 PAD_FRAC = 0.03
@@ -91,6 +96,10 @@ OCR_REC_MODEL_NAME_EN = "en_PP-OCRv5_mobile_rec"
 OCR_REC_MODEL_NAME_AR = "arabic_PP-OCRv5_mobile_rec"
 
 OCR_DEVICE = os.environ.get("OCR_DEVICE", "cpu")
+# How many crops to send to PaddleOCR's predict() in a single call. Not a guide setting --
+# same throughput/memory tradeoff as EMBED_BATCH_SIZE above, sized smaller since the OCR
+# models (server detector + recognizer) are heavier per-image than the DINOv3 backbone.
+OCR_BATCH_SIZE = 16
 
 OCR_ENABLE_MKLDNN = False
 if not OCR_ENABLE_MKLDNN:
@@ -374,25 +383,37 @@ def run_detection(image_path, image_id):
 # STAGE 2 -- EMBED
 # =============================================================================
 
+def embed_crops_batch(crop_paths, processor, model, batch_size=EMBED_BATCH_SIZE):
+    """Runs the DINOv3 backbone once per batch of crops instead of once per crop -- the
+    per-image preprocessing/forward-pass math is identical to the old one-at-a-time
+    embed_crop, this just amortizes the Python/CUDA call overhead and lets the GPU actually
+    process several crops in parallel. Returns a list of L2-normalized (EMBED_DIM,) float64
+    arrays, one per crop_path, in the same order."""
+    embeddings = []
+    for start in range(0, len(crop_paths), batch_size):
+        batch_paths = crop_paths[start:start + batch_size]
+        images = [Image.open(p).convert("RGB") for p in batch_paths]
+        inputs = processor(images=images, return_tensors="pt")
+        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            output = model(**inputs)
+
+        cls = output.last_hidden_state[:, 0, :].cpu().numpy().astype(np.float64)
+        if cls.shape[1] != EMBED_DIM:
+            raise ValueError(
+                f"Backbone produced {cls.shape[1]}-D embeddings, expected {EMBED_DIM}-D."
+            )
+
+        norms = np.linalg.norm(cls, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        cls = cls / norms
+        embeddings.extend(cls)
+    return embeddings
+
+
 def embed_crop(crop_path, processor, model):
-    img = Image.open(crop_path).convert("RGB")
-    inputs = processor(images=img, return_tensors="pt")
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        output = model(**inputs)
-
-    cls = output.last_hidden_state[0][0].cpu().numpy().astype(np.float64)
-
-    if cls.shape[0] != EMBED_DIM:
-        raise ValueError(
-            f"Backbone produced {cls.shape[0]}-D embedding, expected {EMBED_DIM}-D."
-        )
-
-    norm = np.linalg.norm(cls)
-    if norm > 0:
-        cls = cls / norm
-    return cls
+    return embed_crops_batch([crop_path], processor, model)[0]
 
 
 # =============================================================================
@@ -435,29 +456,70 @@ def sku_head_predict(embedding, head, catalog):
     )
 
 
-def cosine_fallback_predict(embedding, embeddings):
-    class_scores = {}
-    emb_list = embedding.tolist()
-    size1 = math.sqrt(sum(a * a for a in emb_list))
+def _embeddings_matrix(embeddings):
+    """Builds a (class_order, L2-normalized reference matrix, {class: [row indices]}) view of
+    the embeddings.json catalog. Cheap enough (hundreds-ish of reference embeddings) to just
+    build once per uploaded image rather than needing its own cache."""
+    names = [item["class"] for item in embeddings]
+    mat = np.array([item["embedding"] for item in embeddings], dtype=np.float64)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat = mat / norms
 
-    for item in embeddings:
-        old = item["embedding"]
-        name = item["class"]
-        dot = sum(a * b for a, b in zip(emb_list, old))
-        size2 = math.sqrt(sum(b * b for b in old))
-        if size1 == 0 or size2 == 0:
+    class_order = list(dict.fromkeys(names))
+    class_row_idx = {name: [] for name in class_order}
+    for i, name in enumerate(names):
+        class_row_idx[name].append(i)
+
+    return class_order, mat, class_row_idx
+
+
+def cosine_fallback_predict_batch(crop_embeddings, embeddings):
+    """Batched version of cosine_fallback_predict: the original scored one crop against the
+    whole embeddings.json catalog via nested pure-Python loops (sum() over zip()) -- with
+    ~150 crops per shelf photo and however many reference embeddings are in the catalog, that
+    was O(crops x references) of scalar Python math and was the single biggest contributor to
+    a slow upload. This computes the same cosine-similarity-per-class-max-then-rank result for
+    every crop at once via one matrix multiply. Returns a list of (top_class, top_score,
+    margin, ranked) tuples, one per crop, in order -- same values cosine_fallback_predict
+    would produce per-crop."""
+    if not embeddings:
+        return [(None, 0.0, 0.0, []) for _ in crop_embeddings]
+
+    class_order, ref_matrix, class_row_idx = _embeddings_matrix(embeddings)
+
+    crop_matrix = np.stack([np.asarray(e, dtype=np.float64) for e in crop_embeddings])
+    crop_norms = np.linalg.norm(crop_matrix, axis=1)
+    # A crop with an exactly-zero embedding has no direction to compare -- the original
+    # skipped scoring it against every reference (size1 == 0 check) and returned an empty
+    # result rather than a fabricated 0%-similarity match. Never happens with a real DINOv3
+    # output, but this keeps the batched version an exact port rather than an approximation.
+    zero_crop = crop_norms == 0
+    safe_norms = np.where(zero_crop, 1.0, crop_norms).reshape(-1, 1)
+    crop_matrix = crop_matrix / safe_norms
+
+    sims = (crop_matrix @ ref_matrix.T) * 100.0  # (num_crops, num_reference_embeddings)
+
+    class_scores = np.empty((len(crop_embeddings), len(class_order)), dtype=np.float64)
+    for j, name in enumerate(class_order):
+        class_scores[:, j] = sims[:, class_row_idx[name]].max(axis=1)
+
+    results = []
+    for row, is_zero in zip(class_scores, zero_crop):
+        if is_zero:
+            results.append((None, 0.0, 0.0, []))
             continue
-        score = (dot / (size1 * size2)) * 100.0
-        if name not in class_scores or score > class_scores[name]:
-            class_scores[name] = score
+        order = np.argsort(-row, kind="stable")
+        top_idx = order[0]
+        top_score = float(row[top_idx])
+        margin = top_score - float(row[order[1]]) if len(order) > 1 else top_score
+        ranked = [(class_order[i], float(row[i])) for i in order]
+        results.append((class_order[top_idx], top_score, margin, ranked))
+    return results
 
-    if not class_scores:
-        return None, 0.0, 0.0, []
 
-    ranked = sorted(class_scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_class, top_score = ranked[0]
-    margin = top_score - ranked[1][1] if len(ranked) > 1 else top_score
-    return top_class, top_score, margin, ranked
+def cosine_fallback_predict(embedding, embeddings):
+    return cosine_fallback_predict_batch([embedding], embeddings)[0]
 
 
 # =============================================================================
@@ -496,22 +558,27 @@ def _to_clahe_gray(pil_crop, upscale=OCR_UPSCALE):
     return cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
 
 
-def _run_ocr_variant(array, ocr_model):
-    results = ocr_model.predict(array)
-    text_parts = []
-    for result in results:
-        res = result.json.get("res", {})
-        rec_texts = res.get("rec_texts", [])
-        if rec_texts:
-            text_parts.extend(rec_texts)
-    return _normalize_ocr_text(" ".join(text_parts))
-
-
-def read_ocr_both_variants(crop_path, ocr_model, label):
-    pil_crop = Image.open(crop_path).convert("RGB")
-    bicubic_text = _run_ocr_variant(_to_bicubic_rgb(pil_crop), ocr_model)
-    clahe_text = _run_ocr_variant(_to_clahe_gray(pil_crop), ocr_model)
-    return bicubic_text, clahe_text
+def _run_ocr_variant_batch(arrays, ocr_model, batch_size=OCR_BATCH_SIZE):
+    """arrays: preprocessed cv2 BGR arrays, one per crop. Runs predict() once per chunk of
+    batch_size arrays instead of once per array, and returns one normalized text string per
+    array, in the same order (matching what calling _run_ocr_variant once per array used to
+    return)."""
+    if not arrays:
+        return []
+    texts = []
+    for start in range(0, len(arrays), batch_size):
+        chunk = arrays[start:start + batch_size]
+        results = list(ocr_model.predict(chunk))
+        if len(results) != len(chunk):
+            raise RuntimeError(
+                f"OCR batch predict returned {len(results)} results for {len(chunk)} inputs "
+                "-- expected exactly one result per input image."
+            )
+        for result in results:
+            res = result.json.get("res", {})
+            rec_texts = res.get("rec_texts", [])
+            texts.append(_normalize_ocr_text(" ".join(rec_texts)))
+    return texts
 
 
 def _kw_in_consensus(keyword, text_a, text_b):
@@ -598,12 +665,10 @@ def _best_keyword_match_consensus(text_a, text_b, keywords, exclude_classes=()):
     return best_class
 
 
-def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs):
-    text_a, text_b = read_ocr_both_variants(crop_path, ocr_model_en, label="EN")
-    ar_a, ar_b = read_ocr_both_variants(crop_path, ocr_model_ar, label="AR")
-
-    all_classes = list(keywords.keys())
-
+def _ocr_decide(top_class, text_a, text_b, ar_a, ar_b, keywords, keywords_ar, size_specs, all_classes):
+    """The guide's OCR-verification decision cascade, unchanged from the original ocr_verify
+    -- just factored out so it can run against texts that were produced by a batched OCR pass
+    instead of computing them inline for a single crop."""
     def _finalize(flavor_class):
         resolved = _resolve_size_variant(
             flavor_class, text_a, text_b, ar_a, ar_b, size_specs, all_classes
@@ -660,82 +725,159 @@ def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywo
     return _finalize(fallback)
 
 
+def ocr_verify_batch(crop_paths, top_classes, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs):
+    """Batched version of ocr_verify: the original ran 4 individual OCR predict() calls
+    (2 preprocessing variants x 2 languages) for EVERY crop that reached this stage. This
+    preprocesses every crop once, then runs each of the 4 (variant, language) combinations as
+    one batched predict() call across all of them, instead of len(crop_paths) x 4 separate
+    calls. crop_paths and top_classes are parallel lists. Returns a list of
+    (verified_class_or_None, text_a, text_b, ar_a, ar_b) tuples, one per crop, in the same
+    order -- identical values to what calling ocr_verify() once per crop would produce."""
+    if not crop_paths:
+        return []
+
+    bicubic_arrays, clahe_arrays = [], []
+    for crop_path in crop_paths:
+        pil_crop = Image.open(crop_path).convert("RGB")
+        bicubic_arrays.append(_to_bicubic_rgb(pil_crop))
+        clahe_arrays.append(_to_clahe_gray(pil_crop))
+
+    text_a_list = _run_ocr_variant_batch(bicubic_arrays, ocr_model_en)
+    text_b_list = _run_ocr_variant_batch(clahe_arrays, ocr_model_en)
+    ar_a_list = _run_ocr_variant_batch(bicubic_arrays, ocr_model_ar)
+    ar_b_list = _run_ocr_variant_batch(clahe_arrays, ocr_model_ar)
+
+    all_classes = list(keywords.keys())
+    return [
+        _ocr_decide(
+            top_classes[i], text_a_list[i], text_b_list[i], ar_a_list[i], ar_b_list[i],
+            keywords, keywords_ar, size_specs, all_classes,
+        )
+        for i in range(len(crop_paths))
+    ]
+
+
+def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs):
+    return ocr_verify_batch(
+        [crop_path], [top_class], ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs
+    )[0]
+
+
 # =============================================================================
 # STAGE 6 -- DECIDE
 # =============================================================================
 
-def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
-                   reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
-                   keywords, keywords_ar, size_specs):
-    row = {
-        "crop_path": crop_path,
+def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
+                          reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
+                          keywords, keywords_ar, size_specs):
+    """Batched version of classify_crop: embeds every crop in one pass (embed_crops_batch),
+    scores all of them against the SKU head or the cosine-fallback catalog in one pass
+    (cosine_fallback_predict_batch), and only runs OCR -- the most expensive stage -- for the
+    subset of crops that actually reach it, as one batched call (ocr_verify_batch) instead of
+    per crop. The reject/BP-target gates stay per-crop: they're tiny single-vector MLP/logreg
+    forward passes (not the bottleneck), and neither is currently installed in this
+    deployment anyway. Returns a list of row dicts, one per crop_path, in the same order and
+    shape classify_crop used to return one at a time."""
+    n = len(crop_paths)
+    rows = [{
+        "crop_path": crop_paths[i],
         "decision": None,
         "matched_class": None,
         "top_class": None,
         "top_score": 0.0,
         "margin": 0.0,
         "scoring_mode": "sku_head" if sku_head is not None else "cosine_fallback",
-    }
+    } for i in range(n)]
 
-    embedding = embed_crop(crop_path, processor, dino_model)
+    if n == 0:
+        return rows
 
-    valid_prob = reject_gate_score(embedding, reject_gate)
-    if valid_prob is not None and valid_prob < REJECT_GATE_THRESHOLD:
-        row["decision"] = REJECT
-        return row
+    crop_embeddings = embed_crops_batch(crop_paths, processor, dino_model)
 
-    bp_prob = bp_target_gate_score(embedding, bp_gate)
-    if bp_prob is not None and bp_prob < BP_TARGET_GATE_THRESHOLD:
-        row["decision"] = NON_TARGET
-        return row
+    pending = []
+    for i, embedding in enumerate(crop_embeddings):
+        valid_prob = reject_gate_score(embedding, reject_gate)
+        if valid_prob is not None and valid_prob < REJECT_GATE_THRESHOLD:
+            rows[i]["decision"] = REJECT
+            continue
+
+        bp_prob = bp_target_gate_score(embedding, bp_gate)
+        if bp_prob is not None and bp_prob < BP_TARGET_GATE_THRESHOLD:
+            rows[i]["decision"] = NON_TARGET
+            continue
+
+        pending.append(i)
+
+    if not pending:
+        return rows
 
     if sku_head is not None:
         if not catalog:
             raise ValueError(
                 f"{SKU_HEAD_PATH} is installed but {CATALOG_PATH} is missing."
             )
-        top_class, top_score, margin, _ = sku_head_predict(embedding, sku_head, catalog)
-        passes = top_score >= EXACT_SKU_THRESHOLD and margin >= MARGIN_FLOOR
+        classify_results = [
+            sku_head_predict(crop_embeddings[i], sku_head, catalog)[:3] for i in pending
+        ]
     else:
         if not embeddings:
             raise ValueError(
                 f"Neither {SKU_HEAD_PATH} nor a usable {EMBEDDINGS_PATH} is "
                 "available -- there is no way to classify."
             )
-        top_class, top_score, margin, _ = cosine_fallback_predict(embedding, embeddings)
+        classify_results = [
+            r[:3] for r in cosine_fallback_predict_batch(
+                [crop_embeddings[i] for i in pending], embeddings
+            )
+        ]
+
+    ocr_needed_idx, ocr_top_classes = [], []
+    for pos, i in enumerate(pending):
+        top_class, top_score, margin = classify_results[pos]
         passes = (
-            top_score >= COSINE_FALLBACK_THRESHOLD
-            and margin >= COSINE_FALLBACK_MARGIN
+            top_score >= EXACT_SKU_THRESHOLD and margin >= MARGIN_FLOOR
+            if sku_head is not None else
+            top_score >= COSINE_FALLBACK_THRESHOLD and margin >= COSINE_FALLBACK_MARGIN
         )
 
-    row["top_class"] = top_class
-    row["top_score"] = top_score
-    row["margin"] = margin
+        rows[i]["top_class"] = top_class
+        rows[i]["top_score"] = top_score
+        rows[i]["margin"] = margin
 
-    if not passes:
-        score_too_low = (
-            top_score < EXACT_SKU_THRESHOLD if sku_head is not None
-            else top_score < COSINE_FALLBACK_THRESHOLD
+        if not passes:
+            score_too_low = (
+                top_score < EXACT_SKU_THRESHOLD if sku_head is not None
+                else top_score < COSINE_FALLBACK_THRESHOLD
+            )
+            rows[i]["decision"] = NON_TARGET if score_too_low and bp_gate is None else UNKNOWN
+            continue
+
+        ocr_needed_idx.append(i)
+        ocr_top_classes.append(top_class)
+
+    if ocr_needed_idx:
+        ocr_results = ocr_verify_batch(
+            [crop_paths[i] for i in ocr_needed_idx], ocr_top_classes,
+            ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs,
         )
-        if score_too_low and bp_gate is None:
-            row["decision"] = NON_TARGET
-        elif score_too_low:
-            row["decision"] = UNKNOWN
-        else:
-            row["decision"] = UNKNOWN
-        return row
+        for i, (verified_class, *_rest) in zip(ocr_needed_idx, ocr_results):
+            if verified_class is None:
+                rows[i]["decision"] = UNKNOWN
+            else:
+                rows[i]["decision"] = EXACT_SKU
+                rows[i]["matched_class"] = verified_class
 
-    verified_class, *_ = ocr_verify(
-        crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs
-    )
+    return rows
 
-    if verified_class is None:
-        row["decision"] = UNKNOWN
-        return row
 
-    row["decision"] = EXACT_SKU
-    row["matched_class"] = verified_class
-    return row
+def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
+                   reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
+                   keywords, keywords_ar, size_specs):
+    return classify_crops_batch(
+        [crop_path], processor, dino_model, catalog, embeddings,
+        reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
+        keywords, keywords_ar, size_specs,
+    )[0]
 
 
 # =============================================================================
@@ -764,18 +906,20 @@ def process_shelf_image(image_path, image_id):
 
     crop_paths, crop_boxes, width, height = run_detection(image_path, image_id)
 
-    detections = []
-    for crop_path, box in zip(crop_paths, crop_boxes):
-        row = classify_crop(
-            crop_path, processor, dino_model, catalog, embeddings,
-            reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
-            keywords, keywords_ar, size_specs,
-        )
-        detections.append({
+    rows = classify_crops_batch(
+        crop_paths, processor, dino_model, catalog, embeddings,
+        reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
+        keywords, keywords_ar, size_specs,
+    )
+
+    detections = [
+        {
             "decision": row["decision"],
             "matched_class": row["matched_class"],
             "bbox": box,
             "score": row["top_score"],
-        })
+        }
+        for row, box in zip(rows, crop_boxes)
+    ]
 
     return {"detections": detections, "image_width": width, "image_height": height}
