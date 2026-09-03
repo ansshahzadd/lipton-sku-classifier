@@ -62,14 +62,17 @@ The frontend (`npm run dev` in the repo root) expects this at
 ## Run on Colab GPU (no local GPU needed)
 
 If your machine has no GPU and the cascade is too slow to test locally, `colab_run.ipynb` runs
-this backend on a free Colab GPU runtime and exposes it over an ngrok tunnel (Cloudflare's free
-quick tunnel force-closes requests after ~100s, which a slow multi-crop upload can exceed), so
-your local frontend can point `VITE_API_BASE` at it instead of `localhost:8000`. Open the
-notebook in Colab, follow the one-time setup notes in its first cell (Google Drive for
-`models/`/`data/`, a Hugging Face token for the gated DINOv3 model, an ngrok authtoken), and run
-all cells — the last one prints the tunnel URL to paste into `frontend/.env`. `OCR_DEVICE=gpu`
-and a `paddlepaddle-gpu` install are handled by the notebook so the OCR stage gets the GPU
-speedup too, not just detection/embedding.
+this backend on a free Colab GPU runtime and joins it to a Tailscale network, so your local
+frontend can point `VITE_API_BASE` at it instead of `localhost:8000`. We use Tailscale rather
+than an HTTP tunnel (ngrok/Cloudflare) because those force-close a request after a fixed time
+(~100s–300s on their free tiers), which a slow multi-crop shelf-image upload can exceed —
+Tailscale is a direct private network link with no such cap, at the cost of needing Tailscale
+installed on your local machine too (same tailnet as the Colab VM). Open the notebook in Colab,
+follow the one-time setup notes in its first cell (Tailscale on your machine, Google Drive for
+`models/`/`data/`, a Hugging Face token for the gated DINOv3 model, a Tailscale auth key), and
+run all cells — the last one prints the backend's tailnet address to paste into `frontend/.env`.
+`OCR_DEVICE=gpu` and a `paddlepaddle-gpu` install are handled by the notebook so the OCR stage
+gets the GPU speedup too, not just detection/embedding.
 
 ## Endpoints
 

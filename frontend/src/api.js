@@ -7,12 +7,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 async function request(path, options) {
   let res;
   try {
-    // ngrok's free tier serves an HTML warning page to the first request from any client
-    // unless this header is present; harmless against any other backend host.
-    res = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers: { ...options?.headers, "ngrok-skip-browser-warning": "true" },
-    });
+    res = await fetch(`${API_BASE}${path}`, options);
   } catch {
     throw new Error(`Could not reach the backend at ${API_BASE}. Is it running (uvicorn main:app)?`);
   }
