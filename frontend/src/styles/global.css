@@ -1,0 +1,108 @@
+@import "./tokens.css";
+
+/* Same substitution the .dc export used: Inter Variable has no local binary. */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/npm/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2")
+      format("woff2-variations"),
+    url("https://rsms.me/inter/font-files/InterVariable.woff2") format("woff2");
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-default);
+  background: var(--page-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+a {
+  color: var(--text-link);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+.nav-link {
+  text-decoration: none;
+  background: transparent;
+}
+.nav-link:hover {
+  background: var(--s-box-subdued);
+}
+.nav-link--active,
+.nav-link--active:hover {
+  background: var(--s-box-subdued);
+}
+
+.card {
+  border-radius: var(--radius-card);
+  background: var(--s-box-base);
+  box-shadow: var(--shadow-card);
+}
+
+.image-card {
+  border-radius: var(--radius-card);
+  background: var(--s-box-base);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  cursor: pointer;
+  display: block;
+  text-align: left;
+  border: none;
+  padding: 0;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+}
+.image-card:hover {
+  box-shadow: var(--shadow-popover);
+}
+
+.link-button {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.link-button:hover {
+  text-decoration: underline;
+}
+
+.back-button {
+  border: none;
+  background: transparent;
+  padding: 4px 6px;
+  margin-left: -6px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text-subdued);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.back-button:hover {
+  background: var(--s-box-subdued);
+}

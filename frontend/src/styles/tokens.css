@@ -1,0 +1,63 @@
+/* Design tokens ported from the Polaris UI Kit export (project/_ds/.../tokens/foundations.css
+   and components/figma/fig-tokens.css). Only the values this app actually uses are kept. */
+:root {
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  --font-weight-regular: 450;
+  --font-weight-medium: 550;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 650;
+
+  --radius-button: 8px;
+  --radius-card: 12px;
+  --radius-full: 9999px;
+
+  /* surfaces */
+  --s-box-base: rgb(255, 255, 255);
+  --s-box-subdued: rgb(247, 247, 247);
+  --s-box-strong: rgb(243, 243, 243);
+  --page-bg: rgb(241, 241, 241);
+
+  /* borders */
+  --s-border-base: rgb(227, 227, 227);
+  --s-border-subdued: rgb(235, 235, 235);
+  --s-border-strong: rgb(204, 204, 204);
+
+  /* text */
+  --text-default: rgb(48, 48, 48);
+  --text-subdued: rgb(97, 97, 97);
+  --text-disabled: rgb(181, 181, 181);
+  --text-link: rgb(0, 91, 211);
+
+  /* icon */
+  --icon-default: rgb(74, 74, 74);
+  --icon-subdued: rgb(138, 138, 138);
+
+  /* button */
+  --s-button-primary: rgb(48, 48, 48);
+  --s-button-text-on-primary: rgb(255, 255, 255);
+
+  /* badge tones */
+  --s-badge-base: rgba(0, 0, 0, 0.06);
+  --s-badge-info-subdued: rgb(213, 235, 255);
+  --s-badge-success-subdued: rgb(205, 254, 212);
+  --s-badge-critical-subdued: rgb(254, 232, 235);
+  --text-info: rgb(0, 82, 124);
+  --text-success: rgb(1, 75, 64);
+  --text-critical: rgb(142, 11, 33);
+
+  /* avatar */
+  --s-avatar-bg: rgb(197, 48, 197);
+  --s-avatar-text: rgb(255, 255, 255);
+
+  /* elevation */
+  --shadow-card: 0px 5px 5px -2.5px rgba(0, 0, 0, 0.03), 0px 3px 3px -1.5px rgba(0, 0, 0, 0.02),
+    0px 2px 2px -1px rgba(0, 0, 0, 0.02), 0px 1px 1px -0.5px rgba(0, 0, 0, 0.03),
+    0px 0.5px 0.5px 0px rgba(0, 0, 0, 0.04), 0px 0px 0px 1px rgba(0, 0, 0, 0.06);
+  --shadow-popover: 0px 4px 12px 0px rgba(0, 0, 0, 0.08), 0px 0px 0px 1px rgba(0, 0, 0, 0.06);
+  --shadow-button-inset: inset 0px -1px 0px 0px rgb(181, 181, 181), inset 0px 0px 0px 1px rgba(0, 0, 0, 0.1),
+    inset 0px 0.5px 0px 1.5px rgb(255, 255, 255);
+  --shadow-button-primary-inset: inset 0px -1px 0px 1px rgba(0, 0, 0, 0.8), inset 0px 0px 0px 1px rgb(48, 48, 48),
+    inset 0px 0.5px 0px 1.5px rgba(255, 255, 255, 0.25);
+}

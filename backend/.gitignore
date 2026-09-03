@@ -1,0 +1,14 @@
+app.db
+media/uploads/*
+media/annotated/*
+media/crops/*
+!media/uploads/.gitkeep
+!media/annotated/.gitkeep
+!media/crops/.gitkeep
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+__pycache__/
+*.pyc
+.venv/

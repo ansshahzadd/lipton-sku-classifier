@@ -1,0 +1,38 @@
+# Frontend (Vite/React) build output and dependencies -- regenerate with
+# `cd frontend && npm install && npm run build`.
+frontend/node_modules
+frontend/dist
+frontend/dist-ssr
+*.local
+
+# Backend (Python) virtual environment and caches -- regenerate with
+# `cd backend && python -m venv .venv && pip install -r requirements.txt`.
+# backend/ also has its own .gitignore for its runtime data (models/,
+# data/, media/, app.db) since those matter only in that directory.
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# Env files -- .env.example is tracked on purpose, real .env files are not.
+.env
+.env.local
+
+# Editor/OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
