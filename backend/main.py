@@ -9,6 +9,7 @@ Run:
 See README.md for the model/data files this expects under models/ and data/.
 """
 
+import asyncio
 import os
 import shutil
 
@@ -57,7 +58,10 @@ async def upload_image(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, out)
 
     try:
-        result = pipeline.process_shelf_image(stored_path, image_id)
+        # process_shelf_image is a long, synchronous, CPU/GPU-bound call. Running it inline
+        # would block this whole (single-threaded) event loop for the duration, freezing every
+        # other request -- including unrelated health checks -- until it finishes.
+        result = await asyncio.to_thread(pipeline.process_shelf_image, stored_path, image_id)
     except FileNotFoundError as e:
         # Model weights / reference data not dropped into models//data/ yet.
         os.remove(stored_path)
