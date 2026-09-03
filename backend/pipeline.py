@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import time
 import unicodedata
 from io import BytesIO
 
@@ -792,8 +793,11 @@ def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
     if n == 0:
         return rows
 
+    t_embed_start = time.perf_counter()
     crop_embeddings = embed_crops_batch(crop_paths, processor, dino_model)
+    t_embed = time.perf_counter() - t_embed_start
 
+    t_gate_start = time.perf_counter()
     pending = []
     for i, embedding in enumerate(crop_embeddings):
         valid_prob = reject_gate_score(embedding, reject_gate)
@@ -807,10 +811,14 @@ def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
             continue
 
         pending.append(i)
+    t_gate = time.perf_counter() - t_gate_start
 
     if not pending:
+        print(f"[pipeline] crops={n} embed={t_embed:.2f}s gate={t_gate:.2f}s "
+              f"classify=0.00s ocr=0.00s (0 reached OCR)")
         return rows
 
+    t_classify_start = time.perf_counter()
     if sku_head is not None:
         if not catalog:
             raise ValueError(
@@ -830,6 +838,7 @@ def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
                 [crop_embeddings[i] for i in pending], embeddings
             )
         ]
+    t_classify = time.perf_counter() - t_classify_start
 
     ocr_needed_idx, ocr_top_classes = [], []
     for pos, i in enumerate(pending):
@@ -855,6 +864,7 @@ def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
         ocr_needed_idx.append(i)
         ocr_top_classes.append(top_class)
 
+    t_ocr_start = time.perf_counter()
     if ocr_needed_idx:
         ocr_results = ocr_verify_batch(
             [crop_paths[i] for i in ocr_needed_idx], ocr_top_classes,
@@ -866,6 +876,10 @@ def classify_crops_batch(crop_paths, processor, dino_model, catalog, embeddings,
             else:
                 rows[i]["decision"] = EXACT_SKU
                 rows[i]["matched_class"] = verified_class
+    t_ocr = time.perf_counter() - t_ocr_start
+
+    print(f"[pipeline] crops={n} embed={t_embed:.2f}s gate={t_gate:.2f}s "
+          f"classify={t_classify:.2f}s ocr={t_ocr:.2f}s ({len(ocr_needed_idx)} reached OCR)")
 
     return rows
 
@@ -892,6 +906,14 @@ def process_shelf_image(image_path, image_id):
         "image_width": int, "image_height": int,
     }
     """
+    t_start = time.perf_counter()
+
+    # All load_*() calls are @lru_cache'd -- near-instant after the first request, but on a
+    # freshly (re)started backend this is where DINOv3/YOLO/OCR actually get downloaded and
+    # built, which can itself take well over a minute and has nothing to do with per-crop
+    # batching. Timed separately so a slow *first* upload after a restart isn't mistaken for
+    # the per-crop pipeline still being slow.
+    t_load_start = time.perf_counter()
     catalog = load_catalog()
     reject_gate = load_reject_gate()
     bp_gate = load_bp_target_gate()
@@ -903,14 +925,21 @@ def process_shelf_image(image_path, image_id):
     size_specs = load_size_specs()
     ocr_model_en = load_ocr_model_en()
     ocr_model_ar = load_ocr_model_ar()
+    t_load = time.perf_counter() - t_load_start
 
+    t_detect_start = time.perf_counter()
     crop_paths, crop_boxes, width, height = run_detection(image_path, image_id)
+    t_detect = time.perf_counter() - t_detect_start
 
     rows = classify_crops_batch(
         crop_paths, processor, dino_model, catalog, embeddings,
         reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
         keywords, keywords_ar, size_specs,
     )
+
+    t_total = time.perf_counter() - t_start
+    print(f"[pipeline] TOTAL={t_total:.2f}s (model_load={t_load:.2f}s detect={t_detect:.2f}s "
+          f"detected_crops={len(crop_paths)})")
 
     detections = [
         {
