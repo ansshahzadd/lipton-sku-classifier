@@ -16,7 +16,6 @@ filenames expected) before calling process_shelf_image().
 
 import functools
 import json
-import math
 import os
 import re
 import unicodedata
@@ -29,16 +28,13 @@ from PIL import Image, ImageOps
 from transformers import AutoImageProcessor, AutoModel
 from ultralytics import YOLO
 
+import storage
+import timing
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
-MEDIA_DIR = os.path.join(BASE_DIR, "media")
-CROPS_DIR = os.path.join(MEDIA_DIR, "crops")
-ANNOTATED_DIR = os.path.join(MEDIA_DIR, "annotated")
-UPLOAD_DIR = os.path.join(MEDIA_DIR, "uploads")
 
-for folder in (CROPS_DIR, ANNOTATED_DIR, UPLOAD_DIR):
-    os.makedirs(folder, exist_ok=True)
 
 
 # =============================================================================
@@ -81,7 +77,6 @@ EXACT_SKU_THRESHOLD = 0.875
 MARGIN_FLOOR = 0.0
 
 # ---- COSINE FALLBACK (NOT a guide setting) --------------------------------
-EMBEDDINGS_PATH = os.path.join(DATA_DIR, "embeddings.json")
 COSINE_FALLBACK_THRESHOLD = 75.0
 COSINE_FALLBACK_MARGIN = 0.0
 
@@ -131,8 +126,8 @@ NON_TARGET = "NON_TARGET"
 # CROP GEOMETRY
 # =============================================================================
 
-def load_image_exif_corrected(path):
-    img = Image.open(path)
+def load_image_exif_corrected(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     return img.convert("RGB")
 
@@ -164,6 +159,10 @@ def make_recognition_crop(pil_image, x1, y1, x2, y2):
 # =============================================================================
 
 @functools.lru_cache(maxsize=1)
+def log_startup_info():
+    timing.log_startup_info(DEVICE, OCR_DEVICE, WEIGHTS_PATH)
+
+
 def load_yolo_model():
     if not os.path.isfile(WEIGHTS_PATH):
         raise FileNotFoundError(
@@ -215,29 +214,6 @@ def load_sku_head():
     model = torch.load(SKU_HEAD_PATH, map_location=DEVICE, weights_only=False)
     model.eval()
     return model
-
-
-@functools.lru_cache(maxsize=1)
-def load_embeddings():
-    if not os.path.isfile(EMBEDDINGS_PATH):
-        return None
-    embeddings = []
-    with open(EMBEDDINGS_PATH) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                embeddings.append(json.loads(line))
-    if not embeddings:
-        return None
-
-    dim = len(embeddings[0]["embedding"])
-    if dim != EMBED_DIM:
-        raise ValueError(
-            f"{EMBEDDINGS_PATH} contains {dim}-D embeddings, but DINOv3 "
-            f"ViT-B/16 produces {EMBED_DIM}-D. Regenerate them with "
-            f"{DINOV3_MODEL_ID} before using this app."
-        )
-    return tuple(embeddings)
 
 
 @functools.lru_cache(maxsize=1)
@@ -336,46 +312,45 @@ def _next_filename(folder, prefix, ext):
     return f"{prefix}{next_number:06d}{ext}"
 
 
-def run_detection(image_path, image_id):
-    """Returns (crop_paths, crop_boxes, image_width, image_height).
+def run_detection(image_bytes, timings):
+    """Returns (crop_imgs, crop_boxes, image_width, image_height).
     crop_boxes are the RAW detector boxes (unpadded); the padded versions
-    are used for the actual recognition crops written to disk."""
+    are used for the actual in-memory recognition crops (crop_imgs) --
+    those are never written to disk, just fed straight into embed_crop/
+    ocr_verify for this one request."""
     model = load_yolo_model()
-    results = model.predict(
-        source=image_path,
-        imgsz=DET_IMGSZ,
-        conf=DET_CONF,
-        iou=DET_IOU,
-        max_det=DET_MAX_DET,
-        verbose=False,
-    )
-    result = results[0]
 
-    boxes = result.boxes.xyxy.cpu().numpy()
+    with timings.measure("detect"):
+        results = model.predict(
+            source=Image.open(BytesIO(image_bytes)),
+            imgsz=DET_IMGSZ,
+            conf=DET_CONF,
+            iou=DET_IOU,
+            max_det=DET_MAX_DET,
+            verbose=False,
+        )
+        result = results[0]
+        boxes = result.boxes.xyxy.cpu().numpy()
 
-    pil_image = load_image_exif_corrected(image_path)
-    crop_paths, crop_boxes = [], []
+    with timings.measure("crop_prep"):
+        pil_image = load_image_exif_corrected(image_bytes)
+        crop_imgs, crop_boxes = [], []
 
-    crop_subdir = os.path.join(CROPS_DIR, image_id)
-    os.makedirs(crop_subdir, exist_ok=True)
+        for box in boxes:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            crop_imgs.append(make_recognition_crop(pil_image, x1, y1, x2, y2))
+            crop_boxes.append(tuple(int(v) for v in (x1, y1, x2, y2)))
 
-    for i, box in enumerate(boxes):
-        x1, y1, x2, y2 = [float(v) for v in box]
-        crop_img = make_recognition_crop(pil_image, x1, y1, x2, y2)
-        crop_path = os.path.join(crop_subdir, f"crop-{i:04d}.jpg")
-        crop_img.save(crop_path, format="JPEG", quality=JPEG_QUALITY, subsampling=JPEG_SUBSAMPLING)
-        crop_paths.append(crop_path)
-        crop_boxes.append(tuple(int(v) for v in (x1, y1, x2, y2)))
-
-    return crop_paths, crop_boxes, pil_image.width, pil_image.height
+    timings.n_detections = len(crop_imgs)
+    return crop_imgs, crop_boxes, pil_image.width, pil_image.height
 
 
 # =============================================================================
 # STAGE 2 -- EMBED
 # =============================================================================
 
-def embed_crop(crop_path, processor, model):
-    img = Image.open(crop_path).convert("RGB")
+def embed_crop(crop_img, processor, model):
+    img = crop_img.convert("RGB")
     inputs = processor(images=img, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
@@ -435,26 +410,11 @@ def sku_head_predict(embedding, head, catalog):
     )
 
 
-def cosine_fallback_predict(embedding, embeddings):
-    class_scores = {}
-    emb_list = embedding.tolist()
-    size1 = math.sqrt(sum(a * a for a in emb_list))
-
-    for item in embeddings:
-        old = item["embedding"]
-        name = item["class"]
-        dot = sum(a * b for a, b in zip(emb_list, old))
-        size2 = math.sqrt(sum(b * b for b in old))
-        if size1 == 0 or size2 == 0:
-            continue
-        score = (dot / (size1 * size2)) * 100.0
-        if name not in class_scores or score > class_scores[name]:
-            class_scores[name] = score
-
-    if not class_scores:
+def cosine_fallback_predict(embedding):
+    ranked = storage.match_reference_embeddings(embedding)
+    if not ranked:
         return None, 0.0, 0.0, []
 
-    ranked = sorted(class_scores.items(), key=lambda kv: kv[1], reverse=True)
     top_class, top_score = ranked[0]
     margin = top_score - ranked[1][1] if len(ranked) > 1 else top_score
     return top_class, top_score, margin, ranked
@@ -507,16 +467,21 @@ def _run_ocr_variant(array, ocr_model):
     return _normalize_ocr_text(" ".join(text_parts))
 
 
-def read_ocr_both_variants(crop_path, ocr_model, label):
-    pil_crop = Image.open(crop_path).convert("RGB")
-    bicubic_text = _run_ocr_variant(_to_bicubic_rgb(pil_crop), ocr_model)
-    clahe_text = _run_ocr_variant(_to_clahe_gray(pil_crop), ocr_model)
+def read_ocr_both_variants(crop_img, ocr_model, label, timings, key_bicubic, key_clahe):
+    pil_crop = crop_img.convert("RGB")
+    with timings.measure(key_bicubic):
+        bicubic_text = _run_ocr_variant(_to_bicubic_rgb(pil_crop), ocr_model)
+    with timings.measure(key_clahe):
+        clahe_text = _run_ocr_variant(_to_clahe_gray(pil_crop), ocr_model)
     return bicubic_text, clahe_text
 
 
+# EXPERIMENT (revert to `and` to restore two-variant consensus): a keyword
+# counts if EITHER OCR preprocessing variant (bicubic-RGB or CLAHE-gray)
+# read it, not just when both agree.
 def _kw_in_consensus(keyword, text_a, text_b):
     kw = keyword.lower()
-    return kw in text_a and kw in text_b
+    return kw in text_a or kw in text_b
 
 
 def _any_kw_in_consensus(keywords, text_a, text_b):
@@ -563,9 +528,11 @@ def _size_token_present(number, size_type, text):
     return False
 
 
+# EXPERIMENT (revert to `and` to restore two-variant consensus): see
+# _kw_in_consensus above.
 def _size_confirmed_consensus(number, size_type, text_a, text_b):
     return (_size_token_present(number, size_type, text_a)
-            and _size_token_present(number, size_type, text_b))
+            or _size_token_present(number, size_type, text_b))
 
 
 def _size_confirmed(class_name, text_a, text_b, ar_a, ar_b, size_specs):
@@ -598,10 +565,19 @@ def _best_keyword_match_consensus(text_a, text_b, keywords, exclude_classes=()):
     return best_class
 
 
-def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs):
-    text_a, text_b = read_ocr_both_variants(crop_path, ocr_model_en, label="EN")
-    ar_a, ar_b = read_ocr_both_variants(crop_path, ocr_model_ar, label="AR")
+def ocr_verify(crop_img, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs, timings):
+    text_a, text_b = read_ocr_both_variants(
+        crop_img, ocr_model_en, "EN", timings, "ocr_bicubic_en", "ocr_clahe_en"
+    )
+    ar_a, ar_b = read_ocr_both_variants(
+        crop_img, ocr_model_ar, "AR", timings, "ocr_bicubic_ar", "ocr_clahe_ar"
+    )
 
+    with timings.measure("decision"):
+        return _ocr_decide(top_class, text_a, text_b, ar_a, ar_b, keywords, keywords_ar, size_specs)
+
+
+def _ocr_decide(top_class, text_a, text_b, ar_a, ar_b, keywords, keywords_ar, size_specs):
     all_classes = list(keywords.keys())
 
     def _finalize(flavor_class):
@@ -649,9 +625,26 @@ def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywo
 
     class_keywords = keywords.get(top_class, [])
     class_keywords_ar = keywords_ar.get(top_class, [])
-    if (_any_kw_in_consensus(class_keywords, text_a, text_b)
-            or _any_kw_in_consensus(class_keywords_ar, ar_a, ar_b)):
-        return _finalize(top_class)
+    matched_en = _first_matching_kw(class_keywords, text_a, text_b)
+    matched_ar = _first_matching_kw(class_keywords_ar, ar_a, ar_b)
+    if matched_en or matched_ar:
+        # A non-green-tea class can share a flavor word with a green-tea
+        # sibling (e.g. "mint" is a keyword on both lipton-pepermint and
+        # lipton-green-tea-mint-*). If the box also shows a green-tea
+        # marker, that shared word doesn't actually confirm top_class --
+        # it's more likely the crop is really the green-tea sibling that
+        # the visual model mis-ranked. Don't confirm on the shared word
+        # alone in that case; fall through to the class-search below
+        # (which excludes green-tea classes, so it resolves to whichever
+        # plain class fits, or UNKNOWN).
+        looks_like_green_tea = (
+            _any_kw_in_consensus(GREEN_TEA_MARKERS, text_a, text_b)
+            or _all_kw_in_consensus(GREEN_TEA_MARKER_WORDS_AR, ar_a, ar_b)
+        )
+        matched = matched_en or matched_ar
+        shared_with_other_family = not _is_unique_to_family(matched, top_class, keywords, keywords_ar)
+        if not (looks_like_green_tea and shared_with_other_family):
+            return _finalize(top_class)
 
     exclude = GREEN_TEA_CLASSES | BBRL_CLASSES
     fallback = _best_keyword_match_consensus(text_a, text_b, keywords, exclude_classes=exclude)
@@ -664,11 +657,10 @@ def ocr_verify(crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywo
 # STAGE 6 -- DECIDE
 # =============================================================================
 
-def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
+def classify_crop(crop_img, processor, dino_model, catalog,
                    reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
-                   keywords, keywords_ar, size_specs):
+                   keywords, keywords_ar, size_specs, timings):
     row = {
-        "crop_path": crop_path,
         "decision": None,
         "matched_class": None,
         "top_class": None,
@@ -677,14 +669,17 @@ def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
         "scoring_mode": "sku_head" if sku_head is not None else "cosine_fallback",
     }
 
-    embedding = embed_crop(crop_path, processor, dino_model)
+    with timings.measure("embed"):
+        embedding = embed_crop(crop_img, processor, dino_model)
 
-    valid_prob = reject_gate_score(embedding, reject_gate)
+    with timings.measure("gate"):
+        valid_prob = reject_gate_score(embedding, reject_gate)
     if valid_prob is not None and valid_prob < REJECT_GATE_THRESHOLD:
         row["decision"] = REJECT
         return row
 
-    bp_prob = bp_target_gate_score(embedding, bp_gate)
+    with timings.measure("gate"):
+        bp_prob = bp_target_gate_score(embedding, bp_gate)
     if bp_prob is not None and bp_prob < BP_TARGET_GATE_THRESHOLD:
         row["decision"] = NON_TARGET
         return row
@@ -694,15 +689,18 @@ def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
             raise ValueError(
                 f"{SKU_HEAD_PATH} is installed but {CATALOG_PATH} is missing."
             )
-        top_class, top_score, margin, _ = sku_head_predict(embedding, sku_head, catalog)
+        with timings.measure("match"):
+            top_class, top_score, margin, _ = sku_head_predict(embedding, sku_head, catalog)
         passes = top_score >= EXACT_SKU_THRESHOLD and margin >= MARGIN_FLOOR
     else:
-        if not embeddings:
+        with timings.measure("match"):
+            top_class, top_score, margin, _ = cosine_fallback_predict(embedding)
+        if top_class is None:
             raise ValueError(
-                f"Neither {SKU_HEAD_PATH} nor a usable {EMBEDDINGS_PATH} is "
-                "available -- there is no way to classify."
+                f"Neither {SKU_HEAD_PATH} nor any reference embeddings in "
+                "the Postgres reference_embeddings table are available -- "
+                "there is no way to classify."
             )
-        top_class, top_score, margin, _ = cosine_fallback_predict(embedding, embeddings)
         passes = (
             top_score >= COSINE_FALLBACK_THRESHOLD
             and margin >= COSINE_FALLBACK_MARGIN
@@ -725,8 +723,9 @@ def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
             row["decision"] = UNKNOWN
         return row
 
+    timings.m_ocr_attempts += 1
     verified_class, *_ = ocr_verify(
-        crop_path, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs
+        crop_img, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs, timings
     )
 
     if verified_class is None:
@@ -742,19 +741,29 @@ def classify_crop(crop_path, processor, dino_model, catalog, embeddings,
 # ORCHESTRATOR -- runs the full cascade on one uploaded shelf image.
 # =============================================================================
 
-def process_shelf_image(image_path, image_id):
-    """Runs stages 1-6 on every product detected in image_path.
+def process_shelf_image(image_bytes, on_progress=None):
+    """Runs stages 1-6 on every product detected in image_bytes.
+
+    on_progress, if given, is called as on_progress(percent, stage) at each
+    real milestone (model load, detection done, each crop classified) --
+    percent reflects work actually completed, not a simulated/timed guess.
 
     Returns {
         "detections": [{"decision", "matched_class", "bbox": (x1,y1,x2,y2), "score"}, ...],
-        "image_width": int, "image_height": int,
+        "image_width": int, "image_height": int, "timings": timing.Timings,
     }
     """
+    def _report(percent, stage):
+        if on_progress:
+            on_progress(percent, stage)
+
+    timings = timing.Timings()
+
+    _report(5, "loading models")
     catalog = load_catalog()
     reject_gate = load_reject_gate()
     bp_gate = load_bp_target_gate()
     sku_head = load_sku_head()
-    embeddings = load_embeddings() if sku_head is None else None
     processor, dino_model = load_dinov3_model()
     keywords = load_keywords()
     keywords_ar = load_keywords_ar()
@@ -762,14 +771,16 @@ def process_shelf_image(image_path, image_id):
     ocr_model_en = load_ocr_model_en()
     ocr_model_ar = load_ocr_model_ar()
 
-    crop_paths, crop_boxes, width, height = run_detection(image_path, image_id)
+    _report(15, "detecting products")
+    crop_imgs, crop_boxes, width, height = run_detection(image_bytes, timings)
 
+    total = len(crop_imgs)
     detections = []
-    for crop_path, box in zip(crop_paths, crop_boxes):
+    for i, (crop_img, box) in enumerate(zip(crop_imgs, crop_boxes)):
         row = classify_crop(
-            crop_path, processor, dino_model, catalog, embeddings,
+            crop_img, processor, dino_model, catalog,
             reject_gate, bp_gate, sku_head, ocr_model_en, ocr_model_ar,
-            keywords, keywords_ar, size_specs,
+            keywords, keywords_ar, size_specs, timings,
         )
         detections.append({
             "decision": row["decision"],
@@ -777,5 +788,13 @@ def process_shelf_image(image_path, image_id):
             "bbox": box,
             "score": row["top_score"],
         })
+        if total:
+            _report(20 + int(75 * (i + 1) / total), f"classifying crop {i + 1} of {total}")
 
-    return {"detections": detections, "image_width": width, "image_height": height}
+    _report(100, "done")
+    return {
+        "detections": detections,
+        "image_width": width,
+        "image_height": height,
+        "timings": timings,
+    }

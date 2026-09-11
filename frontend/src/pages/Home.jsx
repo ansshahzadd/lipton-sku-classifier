@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import Button from "../components/Button";
 import Badge from "../components/Badge";
+import ProgressRing from "../components/ProgressRing";
 import UploadIcon from "../components/icons/UploadIcon";
 import { useBatchQueue } from "../context/BatchQueueContext";
 
@@ -136,7 +137,14 @@ export default function Home() {
                 </div>
                 <div style={{ fontSize: 12, lineHeight: "16px", fontWeight: 550, color: "var(--text-subdued)" }}>{row.stage}</div>
               </div>
-              <Badge tone={row.tone} content={row.status} />
+              {row.status === "Processing" ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <ProgressRing progress={row.progress} />
+                  <Badge tone={row.tone} content={row.status} />
+                </div>
+              ) : (
+                <Badge tone={row.tone} content={row.status} />
+              )}
             </div>
           ))}
         </div>

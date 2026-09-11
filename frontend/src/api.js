@@ -24,10 +24,15 @@ async function request(path, options) {
   return res.json();
 }
 
-export function uploadImage(file) {
+export function uploadImage(file, progressId) {
   const form = new FormData();
   form.append("file", file);
+  if (progressId) form.append("progress_id", progressId);
   return request("/api/images", { method: "POST", body: form });
+}
+
+export function getUploadProgress(progressId) {
+  return request(`/api/upload-progress/${encodeURIComponent(progressId)}`);
 }
 
 export function listImages(status) {

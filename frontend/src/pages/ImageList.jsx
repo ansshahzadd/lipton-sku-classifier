@@ -4,20 +4,28 @@ import Badge from "../components/Badge";
 import ShelfCanvas from "../components/ShelfCanvas";
 import { layoutBoxes } from "../lib/detections";
 import { listImages } from "../api";
+import { useBatchQueue } from "../context/BatchQueueContext";
 
 export default function ImageList({ status }) {
   const navigate = useNavigate();
+  const { version } = useBatchQueue();
   const [images, setImages] = useState(null);
   const [error, setError] = useState(null);
   const isRejected = status === "rejected";
 
   useEffect(() => {
+    // Deliberately doesn't reset `images` to null here: on first mount
+    // there's nothing to show yet so the "Loading…" branch below covers
+    // it, but on a background refetch (triggered by `version` after an
+    // upload finishes processing) the previously loaded images should
+    // stay on screen until the fresh list arrives, not flash to Loading.
     let cancelled = false;
-    setImages(null);
-    setError(null);
     listImages(status)
       .then((data) => {
-        if (!cancelled) setImages(data.images);
+        if (!cancelled) {
+          setImages(data.images);
+          setError(null);
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e.message);
@@ -25,7 +33,7 @@ export default function ImageList({ status }) {
     return () => {
       cancelled = true;
     };
-  }, [status]);
+  }, [status, version]);
 
   const title = isRejected ? "Rejected" : "Uploads";
   const subtitle = isRejected

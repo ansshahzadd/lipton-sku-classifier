@@ -2,17 +2,25 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getDashboard } from "../api";
 import { prettyClassName } from "../lib/detections";
+import { useBatchQueue } from "../context/BatchQueueContext";
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const { version } = useBatchQueue();
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
+    // No reset to null here: a background refetch (triggered by `version`
+    // once an upload finishes) should swap in fresh numbers once they
+    // arrive, not blank the dashboard while it's fetching.
     let cancelled = false;
     getDashboard()
       .then((d) => {
-        if (!cancelled) setData(d);
+        if (!cancelled) {
+          setData(d);
+          setError(null);
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e.message);
@@ -20,7 +28,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [version]);
 
   if (error) {
     return (

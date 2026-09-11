@@ -1,61 +1,86 @@
 """
-SQLite persistence for processed shelf images + their per-crop detections,
-plus the deterministic per-class color used everywhere the frontend draws a
-box or a legend swatch (so a class always renders the same color across the
-Uploads/Rejected/Preview/Dashboard views without the frontend needing its
-own copy of this logic).
+Postgres persistence for processed shelf images (bytes + metadata), their
+per-crop detections, and the classifier's reference embedding gallery
+(pgvector), plus the deterministic per-class color used everywhere the
+frontend draws a box or a legend swatch (so a class always renders the same
+color across the Uploads/Rejected/Preview/Dashboard views without the
+frontend needing its own copy of this logic).
 """
 
 import colorsys
 import hashlib
 import os
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "app.db")
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+from pgvector.psycopg2 import register_vector
 
 # image_url in every API response is built from this. It must be an
-# ABSOLUTE url (not "/media/...") -- the frontend is served from a
+# ABSOLUTE url (not "/api/...") -- the frontend is served from a
 # different origin (Vite on :5173) than this API (:8000), and a
 # root-relative src in an <img> tag resolves against the PAGE's origin,
 # not this server's, so it'd 404 against the frontend dev server instead
 # of ever reaching this backend. Override with PUBLIC_BASE_URL if the API
 # isn't reachable at localhost:8000 from the browser (e.g. deployed).
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000")
-DEFAULT_MEDIA_BASE = PUBLIC_BASE_URL.rstrip("/") + "/media"
 
 UNKNOWN_COLOR = "#eab308"
 EXACT_SKU = "EXACT_SKU"
 UNKNOWN = "UNKNOWN"
 
+_POOL = psycopg2.pool.ThreadedConnectionPool(
+    1,
+    10,
+    host=os.environ.get("POSTGRES_HOST", "localhost"),
+    port=os.environ.get("POSTGRES_PORT", "5433"),
+    dbname=os.environ.get("POSTGRES_DB", "lipton-sku-classifier"),
+    user=os.environ.get("POSTGRES_USER", "ans.shahzad@vaival.tech"),
+    password=os.environ.get("POSTGRES_PASSWORD", ""),
+    cursor_factory=psycopg2.extras.RealDictCursor,
+)
+
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = _POOL.getconn()
+    register_vector(conn)
     return conn
+
+
+def _release(conn):
+    _POOL.putconn(conn)
 
 
 def init_db():
     conn = _connect()
-    conn.executescript(
+    cur = conn.cursor()
+    cur.execute(
         """
+        CREATE EXTENSION IF NOT EXISTS vector;
+
         CREATE TABLE IF NOT EXISTS images (
             id TEXT PRIMARY KEY,
             filename TEXT NOT NULL,
             status TEXT NOT NULL,
-            image_path TEXT NOT NULL,
             image_width INTEGER NOT NULL,
             image_height INTEGER NOT NULL,
             verified_count INTEGER NOT NULL,
             unknown_count INTEGER NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TIMESTAMPTZ NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS images_status_idx ON images(status);
+        CREATE INDEX IF NOT EXISTS images_created_at_idx ON images(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS image_files (
+            image_id TEXT PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL,
+            data BYTEA NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS detections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
             class_name TEXT,
             decision TEXT NOT NULL,
@@ -65,10 +90,17 @@ def init_db():
             x2 INTEGER NOT NULL,
             y2 INTEGER NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS detections_image_id_idx ON detections(image_id);
+
+        CREATE TABLE IF NOT EXISTS reference_embeddings (
+            id SERIAL PRIMARY KEY,
+            class_name TEXT NOT NULL,
+            embedding VECTOR(768) NOT NULL
+        );
         """
     )
     conn.commit()
-    conn.close()
+    _release(conn)
 
 
 def class_color(class_name):
@@ -89,12 +121,8 @@ def new_image_id():
     return "img_" + uuid.uuid4().hex[:12]
 
 
-def save_image_result(image_id, filename, image_path, image_width, image_height, detections):
-    """Persists one processed shelf image and its detections.
-
-    `image_path` is the path to the stored original photo, relative to
-    backend/media (e.g. "uploads/img_xxx.jpg"), so it can be turned into a
-    URL under the /media static mount.
+def save_image_result(image_id, filename, image_bytes, content_type, image_width, image_height, detections):
+    """Persists one processed shelf image (bytes + metadata) and its detections.
 
     Status rule (matches the Uploads/Rejected copy already in the
     frontend): approved when verified (EXACT_SKU) crops are at least as
@@ -108,51 +136,60 @@ def save_image_result(image_id, filename, image_path, image_width, image_height,
     verified_count = sum(1 for d in detections if d["decision"] == EXACT_SKU)
     unknown_count = sum(1 for d in detections if d["decision"] == UNKNOWN)
     status = "approved" if verified_count >= unknown_count else "rejected"
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = datetime.now(timezone.utc)
 
     conn = _connect()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """INSERT INTO images
-           (id, filename, status, image_path, image_width, image_height,
+           (id, filename, status, image_width, image_height,
             verified_count, unknown_count, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (image_id, filename, status, image_path, image_width, image_height,
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (image_id, filename, status, image_width, image_height,
          verified_count, unknown_count, created_at),
     )
-    conn.executemany(
+    cur.execute(
+        """INSERT INTO image_files (image_id, content_type, data)
+           VALUES (%s, %s, %s)""",
+        (image_id, content_type, psycopg2.Binary(image_bytes)),
+    )
+    psycopg2.extras.execute_values(
+        cur,
         """INSERT INTO detections
            (image_id, class_name, decision, score, x1, y1, x2, y2)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES %s""",
         [
             (image_id, d["matched_class"], d["decision"], d["score"], *d["bbox"])
             for d in detections
         ],
     )
     conn.commit()
-    conn.close()
+    _release(conn)
     return get_image(image_id)
 
 
-def _row_to_summary(row, media_base):
+def _row_to_summary(row):
     return {
         "id": row["id"],
         "name": row["filename"],
         "status": row["status"],
-        "captured": "Uploaded " + row["created_at"][:16].replace("T", " "),
-        "image_url": f"{media_base}/{row['image_path']}",
+        "captured": row["created_at"].strftime("Uploaded %Y-%m-%d %H:%M"),
+        "image_url": f"{PUBLIC_BASE_URL}/api/images/{row['id']}/file",
         "image_width": row["image_width"],
         "image_height": row["image_height"],
         "verified_count": row["verified_count"],
         "unknown_count": row["unknown_count"],
-        "created_at": row["created_at"],
+        "created_at": row["created_at"].isoformat(),
     }
 
 
 def _detections_for(conn, image_id):
-    rows = conn.execute(
-        "SELECT class_name, decision, score, x1, y1, x2, y2 FROM detections WHERE image_id = ? ORDER BY id",
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT class_name, decision, score, x1, y1, x2, y2 FROM detections WHERE image_id = %s ORDER BY id",
         (image_id,),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
     return [
         {
             "class_name": r["class_name"],
@@ -165,45 +202,61 @@ def _detections_for(conn, image_id):
     ]
 
 
-def list_images(status=None, media_base=DEFAULT_MEDIA_BASE):
+def list_images(status=None):
     conn = _connect()
+    cur = conn.cursor()
     if status:
-        rows = conn.execute(
-            "SELECT * FROM images WHERE status = ? ORDER BY created_at DESC", (status,)
-        ).fetchall()
+        cur.execute(
+            "SELECT * FROM images WHERE status = %s ORDER BY created_at DESC", (status,)
+        )
     else:
-        rows = conn.execute("SELECT * FROM images ORDER BY created_at DESC").fetchall()
+        cur.execute("SELECT * FROM images ORDER BY created_at DESC")
+    rows = cur.fetchall()
 
     out = []
     for row in rows:
-        summary = _row_to_summary(row, media_base)
+        summary = _row_to_summary(row)
         summary["detections"] = _detections_for(conn, row["id"])
         out.append(summary)
-    conn.close()
+    _release(conn)
     return out
 
 
-def get_image(image_id, media_base=DEFAULT_MEDIA_BASE):
+def get_image(image_id):
     conn = _connect()
-    row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM images WHERE id = %s", (image_id,))
+    row = cur.fetchone()
     if row is None:
-        conn.close()
+        _release(conn)
         return None
-    summary = _row_to_summary(row, media_base)
+    summary = _row_to_summary(row)
     summary["detections"] = _detections_for(conn, image_id)
-    conn.close()
+    _release(conn)
     return summary
 
 
-def dashboard_data(media_base=DEFAULT_MEDIA_BASE):
+def get_image_file(image_id):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT content_type, data FROM image_files WHERE image_id = %s", (image_id,))
+    row = cur.fetchone()
+    _release(conn)
+    if row is None:
+        return None
+    return {"content_type": row["content_type"], "data": bytes(row["data"])}
+
+
+def dashboard_data():
     """Aggregation ported from the mock Dashboard.jsx page, now computed
     over real persisted images/detections instead of the 6-item mock
     catalog."""
     conn = _connect()
-    approved_rows = conn.execute(
-        "SELECT * FROM images WHERE status = 'approved' ORDER BY created_at DESC"
-    ).fetchall()
-    rejected_rows = conn.execute("SELECT * FROM images WHERE status = 'rejected'").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM images WHERE status = 'approved' ORDER BY created_at DESC")
+    approved_rows = cur.fetchall()
+    cur.execute("SELECT * FROM images WHERE status = 'rejected'")
+    rejected_rows = cur.fetchall()
 
     classified = sum(r["verified_count"] + r["unknown_count"] for r in approved_rows)
     verified = sum(r["verified_count"] for r in approved_rows)
@@ -212,10 +265,11 @@ def dashboard_data(media_base=DEFAULT_MEDIA_BASE):
 
     per_class = {}
     for r in approved_rows:
-        for d in conn.execute(
-            "SELECT class_name FROM detections WHERE image_id = ? AND decision = 'EXACT_SKU'",
+        cur.execute(
+            "SELECT class_name FROM detections WHERE image_id = %s AND decision = 'EXACT_SKU'",
             (r["id"],),
-        ):
+        )
+        for d in cur.fetchall():
             per_class[d["class_name"]] = per_class.get(d["class_name"], 0) + 1
 
     sku_rows = [
@@ -238,7 +292,7 @@ def dashboard_data(media_base=DEFAULT_MEDIA_BASE):
         for r in approved_rows
     ]
 
-    conn.close()
+    _release(conn)
     return {
         "approved_total": len(approved_rows),
         "stats": {
@@ -251,3 +305,37 @@ def dashboard_data(media_base=DEFAULT_MEDIA_BASE):
         "sku_rows": sku_rows,
         "image_rows": image_rows,
     }
+
+
+def match_reference_embeddings(embedding):
+    """Per-class best cosine match against the reference gallery, scored
+    0-100 like the pre-Postgres brute-force Python loop. Returns
+    [(class_name, score), ...] sorted best first."""
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT class_name, MAX(1 - (embedding <=> %s)) * 100.0 AS score
+           FROM reference_embeddings
+           GROUP BY class_name
+           ORDER BY score DESC""",
+        (embedding,),
+    )
+    rows = cur.fetchall()
+    _release(conn)
+    return [(r["class_name"], float(r["score"])) for r in rows]
+
+
+def bulk_insert_reference_embeddings(rows):
+    """rows: iterable of (class_name, embedding_list). Used by the
+    one-time backend/scripts/migrate_embeddings.py import; truncates first
+    so it's safe to re-run."""
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("TRUNCATE reference_embeddings")
+    psycopg2.extras.execute_values(
+        cur,
+        "INSERT INTO reference_embeddings (class_name, embedding) VALUES %s",
+        list(rows),
+    )
+    conn.commit()
+    _release(conn)

@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 python-multipart
+psycopg2-binary
+pgvector
 torch
 torchvision
 opencv-python
