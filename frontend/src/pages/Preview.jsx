@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import Badge from "../components/Badge";
+import PipelineSidebar from "../components/PipelineSidebar";
 import ShelfCanvas from "../components/ShelfCanvas";
 import { DECISION_COLORS, GREY, layoutBoxes, prettyClassName } from "../lib/detections";
 import { getImage } from "../api";
@@ -10,11 +11,13 @@ export default function Preview({ from }) {
   const navigate = useNavigate();
   const [img, setImg] = useState(null);
   const [error, setError] = useState(null);
+  const [selected, setSelected] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     setImg(null);
     setError(null);
+    setSelected(null);
     getImage(id)
       .then((data) => {
         if (!cancelled) setImg(data);
@@ -86,7 +89,7 @@ export default function Preview({ from }) {
   ];
 
   return (
-    <div style={{ maxWidth: 1160, margin: "0 auto", padding: "24px 24px 64px", display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ maxWidth: 1440, margin: "0 auto", padding: "24px 24px 64px", display: "flex", flexDirection: "column", gap: 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
         <button className="back-button" onClick={() => navigate(`/${from}`)}>
           {backLabel}
@@ -95,7 +98,9 @@ export default function Preview({ from }) {
         <span style={{ fontSize: 12, fontWeight: 550, color: "var(--text-subdued)" }}>{img.name}</span>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 320px", gap: 16, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "260px minmax(0,1fr) 320px", gap: 16, alignItems: "start" }}>
+        <PipelineSidebar detection={selected !== null ? img.detections[selected] : null} timings={img.timings} />
+
         <div className="card" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -114,6 +119,8 @@ export default function Preview({ from }) {
             imageUrl={img.image_url}
             imageWidth={img.image_width}
             imageHeight={img.image_height}
+            selected={selected}
+            onSelect={setSelected}
           />
 
           <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>

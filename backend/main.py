@@ -121,6 +121,28 @@ async def upload_image(file: UploadFile = File(...), progress_id: str | None = F
         image_timings.total = time.perf_counter() - t_start
         timing.log_timings(image_id, image_timings)
 
+        # Whole-image (not per-crop) duration summary, grouped into the
+        # same 6 guide stages the terminal report's "WHAT EACH STAGE
+        # ACTUALLY USED" section names -- this is what the Preview page's
+        # pipeline sidebar shows when no product box is selected. Persisted
+        # (not just returned) so reopening the image later still shows it.
+        seconds = image_timings.seconds
+        timings_summary = {
+            "detect": seconds["detect"] + seconds["crop_prep"],
+            "embed": seconds["embed"],
+            "gate": seconds["gate"],
+            "classify": seconds["match"],
+            "verify": (
+                seconds["ocr_bicubic_en"] + seconds["ocr_clahe_en"]
+                + seconds["ocr_bicubic_ar"] + seconds["ocr_clahe_ar"]
+            ),
+            "decide": seconds["decision"],
+            "db_save": seconds["db_save"],
+            "total": image_timings.total,
+        }
+        await run_in_threadpool(storage.save_image_timings, image_id, timings_summary)
+        record["timings"] = timings_summary
+
         return record
     finally:
         if progress_id:

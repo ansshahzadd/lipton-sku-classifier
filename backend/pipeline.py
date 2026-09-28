@@ -111,7 +111,9 @@ def _class_family(class_name):
 LIPTON_KEYWORD_AR = "ليبتون"
 GREEN_TEA_MARKER_WORDS_AR = ["شاي", "اخضر"]
 
-OCR_UPSCALE = 2.0
+# EXPERIMENT: OCR_UPSCALE removed (was 2.0) to test its effect on OCR
+# latency -- _to_bicubic_rgb/_to_clahe_gray no longer resize at all.
+# Reinstate `upscale=2.0` on both functions' resize calls to restore it.
 
 # =============================================================================
 # Decision types (guide stage 6)
@@ -160,7 +162,15 @@ def make_recognition_crop(pil_image, x1, y1, x2, y2):
 
 @functools.lru_cache(maxsize=1)
 def log_startup_info():
-    timing.log_startup_info(DEVICE, OCR_DEVICE, WEIGHTS_PATH)
+    timing.log_startup_info(
+        DEVICE,
+        OCR_DEVICE,
+        WEIGHTS_PATH,
+        reject_gate_active=load_reject_gate() is not None,
+        bp_gate_active=load_bp_target_gate() is not None,
+        sku_head_active=load_sku_head() is not None,
+        scoring_mode="sku_head" if load_sku_head() is not None else "cosine_fallback",
+    )
 
 
 def load_yolo_model():
@@ -269,32 +279,43 @@ def load_size_specs():
     return specs
 
 
-def _build_ocr_model(rec_model_name, lang):
-    from paddleocr import PaddleOCR
+# Detection (where is there text) and recognition (what does it say) are two
+# separate models. The English and Arabic passes only ever differ in
+# recognition -- both use the exact same detector (OCR_DET_MODEL_NAME) -- so
+# detection is run ONCE per preprocessing variant (bicubic/CLAHE) and its
+# boxes are reused for both languages' recognition, instead of re-detecting
+# from scratch for each language like the old fused-PaddleOCR-per-language
+# setup did. Verified to produce byte-identical recognized text to the old
+# approach on a test crop before this was wired in.
+@functools.lru_cache(maxsize=1)
+def load_ocr_detector():
+    from paddleocr import TextDetection
 
-    kwargs = dict(
-        text_detection_model_name=OCR_DET_MODEL_NAME,
-        text_recognition_model_name=rec_model_name,
-        lang=lang,
-        device=OCR_DEVICE,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-    )
+    kwargs = dict(model_name=OCR_DET_MODEL_NAME, device=OCR_DEVICE)
     try:
-        return PaddleOCR(enable_mkldnn=OCR_ENABLE_MKLDNN, **kwargs)
+        return TextDetection(enable_mkldnn=OCR_ENABLE_MKLDNN, **kwargs)
     except TypeError:
-        return PaddleOCR(**kwargs)
+        return TextDetection(**kwargs)
+
+
+def _build_ocr_recognizer(rec_model_name):
+    from paddleocr import TextRecognition
+
+    kwargs = dict(model_name=rec_model_name, device=OCR_DEVICE)
+    try:
+        return TextRecognition(enable_mkldnn=OCR_ENABLE_MKLDNN, **kwargs)
+    except TypeError:
+        return TextRecognition(**kwargs)
 
 
 @functools.lru_cache(maxsize=1)
 def load_ocr_model_en():
-    return _build_ocr_model(OCR_REC_MODEL_NAME_EN, lang="en")
+    return _build_ocr_recognizer(OCR_REC_MODEL_NAME_EN)
 
 
 @functools.lru_cache(maxsize=1)
 def load_ocr_model_ar():
-    return _build_ocr_model(OCR_REC_MODEL_NAME_AR, lang="ar")
+    return _build_ocr_recognizer(OCR_REC_MODEL_NAME_AR)
 
 
 # =============================================================================
@@ -320,9 +341,17 @@ def run_detection(image_bytes, timings):
     ocr_verify for this one request."""
     model = load_yolo_model()
 
+    # Detect on the SAME image the crops are cut from. Boxes from a
+    # differently-oriented source (e.g. the raw, un-rotated bytes) aren't
+    # guaranteed to be valid coordinates once EXIF rotation swaps width and
+    # height -- for a 90/270-degree-rotated photo this produced an inverted
+    # crop box and crashed PIL's crop(). No effect on the common case (no
+    # meaningful EXIF rotation): raw and corrected images are identical then.
+    pil_image = load_image_exif_corrected(image_bytes)
+
     with timings.measure("detect"):
         results = model.predict(
-            source=Image.open(BytesIO(image_bytes)),
+            source=pil_image,
             imgsz=DET_IMGSZ,
             conf=DET_CONF,
             iou=DET_IOU,
@@ -333,11 +362,17 @@ def run_detection(image_bytes, timings):
         boxes = result.boxes.xyxy.cpu().numpy()
 
     with timings.measure("crop_prep"):
-        pil_image = load_image_exif_corrected(image_bytes)
         crop_imgs, crop_boxes = [], []
 
         for box in boxes:
             x1, y1, x2, y2 = [float(v) for v in box]
+            px1, py1, px2, py2 = padded_box(x1, y1, x2, y2, pil_image.width, pil_image.height)
+            if px2 <= px1 or py2 <= py1:
+                # Defensive: skip a degenerate box rather than crash. Should
+                # no longer be reachable now that detection and cropping
+                # share the same image, but a corrupt/zero-area detector box
+                # is still a theoretical possibility worth not crashing on.
+                continue
             crop_imgs.append(make_recognition_crop(pil_image, x1, y1, x2, y2))
             crop_boxes.append(tuple(int(v) for v in (x1, y1, x2, y2)))
 
@@ -440,40 +475,77 @@ def _normalize_ocr_text(text):
     return re.sub(r"\s+", " ", no_accents.strip().lower())
 
 
-def _to_bicubic_rgb(pil_crop, upscale=OCR_UPSCALE):
+def _to_bicubic_rgb(pil_crop):
     arr = np.array(pil_crop.convert("RGB"))
-    h, w = arr.shape[:2]
-    resized = cv2.resize(arr, (int(w * upscale), int(h * upscale)), interpolation=cv2.INTER_CUBIC)
-    return cv2.cvtColor(resized, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def _to_clahe_gray(pil_crop, upscale=OCR_UPSCALE):
+def _to_clahe_gray(pil_crop):
     gray = np.array(pil_crop.convert("L"))
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    h, w = enhanced.shape[:2]
-    resized = cv2.resize(enhanced, (int(w * upscale), int(h * upscale)), interpolation=cv2.INTER_CUBIC)
-    return cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
 
-def _run_ocr_variant(array, ocr_model):
-    results = ocr_model.predict(array)
-    text_parts = []
-    for result in results:
-        res = result.json.get("res", {})
-        rec_texts = res.get("rec_texts", [])
-        if rec_texts:
-            text_parts.extend(rec_texts)
+# The next three helpers replace the fused PaddleOCR().predict() call. They
+# reproduce its internal detect -> sort boxes -> perspective-crop ->
+# recognize steps by hand so detection can be shared across languages;
+# ported directly from paddlex's own SortQuadBoxes / CropByPolys operators
+# (paddlex/inference/pipelines/components/common/{sort_boxes,crop_image_regions}.py)
+# rather than importing those internal classes, and verified to produce
+# byte-identical text to the old fused-pipeline call before being wired in.
+
+def _sort_quad_boxes(dt_polys):
+    boxes = list(sorted(dt_polys, key=lambda box: (box[0][1], box[0][0])))
+    n = len(boxes)
+    for i in range(n - 1):
+        for j in range(i, -1, -1):
+            if (abs(boxes[j + 1][0][1] - boxes[j][0][1]) < 10
+                    and boxes[j + 1][0][0] < boxes[j][0][0]):
+                boxes[j], boxes[j + 1] = boxes[j + 1], boxes[j]
+            else:
+                break
+    return boxes
+
+
+def _crop_quad_box(img, points):
+    bounding_box = cv2.minAreaRect(np.array(points).astype(np.int32))
+    pts = sorted(list(cv2.boxPoints(bounding_box)), key=lambda p: p[0])
+    if pts[1][1] > pts[0][1]:
+        index_a, index_d = 0, 1
+    else:
+        index_a, index_d = 1, 0
+    if pts[3][1] > pts[2][1]:
+        index_b, index_c = 2, 3
+    else:
+        index_b, index_c = 3, 2
+    box = np.array([pts[index_a], pts[index_b], pts[index_c], pts[index_d]], dtype=np.float32)
+
+    width = int(max(np.linalg.norm(box[0] - box[1]), np.linalg.norm(box[2] - box[3])))
+    height = int(max(np.linalg.norm(box[0] - box[3]), np.linalg.norm(box[1] - box[2])))
+    dst = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
+    transform = cv2.getPerspectiveTransform(box, dst)
+    crop = cv2.warpPerspective(
+        img, transform, (width, height),
+        borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC,
+    )
+    if crop.shape[0] / max(crop.shape[1], 1) >= 1.5:
+        crop = np.rot90(crop)
+    return crop
+
+
+def _detect_text_boxes(array):
+    detector = load_ocr_detector()
+    result = list(detector.predict(array))[0]
+    polys = _sort_quad_boxes(list(result["dt_polys"]))
+    return [_crop_quad_box(array, poly) for poly in polys]
+
+
+def _recognize_text(sub_images, recognizer):
+    if not sub_images:
+        return ""
+    text_parts = [r["rec_text"] for r in recognizer.predict(sub_images) if r.get("rec_text")]
     return _normalize_ocr_text(" ".join(text_parts))
-
-
-def read_ocr_both_variants(crop_img, ocr_model, label, timings, key_bicubic, key_clahe):
-    pil_crop = crop_img.convert("RGB")
-    with timings.measure(key_bicubic):
-        bicubic_text = _run_ocr_variant(_to_bicubic_rgb(pil_crop), ocr_model)
-    with timings.measure(key_clahe):
-        clahe_text = _run_ocr_variant(_to_clahe_gray(pil_crop), ocr_model)
-    return bicubic_text, clahe_text
 
 
 # EXPERIMENT (revert to `and` to restore two-variant consensus): a keyword
@@ -566,12 +638,25 @@ def _best_keyword_match_consensus(text_a, text_b, keywords, exclude_classes=()):
 
 
 def ocr_verify(crop_img, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs, timings):
-    text_a, text_b = read_ocr_both_variants(
-        crop_img, ocr_model_en, "EN", timings, "ocr_bicubic_en", "ocr_clahe_en"
-    )
-    ar_a, ar_b = read_ocr_both_variants(
-        crop_img, ocr_model_ar, "AR", timings, "ocr_bicubic_ar", "ocr_clahe_ar"
-    )
+    pil_crop = crop_img.convert("RGB")
+
+    # Detection runs once per preprocessing variant and is shared by both
+    # languages' recognition below -- timed under the EN buckets since that's
+    # the first consumer; the AR buckets that follow only pay for
+    # recognition, reusing these same boxes.
+    with timings.measure("ocr_bicubic_en"):
+        bicubic_boxes = _detect_text_boxes(_to_bicubic_rgb(pil_crop))
+        text_a = _recognize_text(bicubic_boxes, ocr_model_en)
+
+    with timings.measure("ocr_clahe_en"):
+        clahe_boxes = _detect_text_boxes(_to_clahe_gray(pil_crop))
+        text_b = _recognize_text(clahe_boxes, ocr_model_en)
+
+    with timings.measure("ocr_bicubic_ar"):
+        ar_a = _recognize_text(bicubic_boxes, ocr_model_ar)
+
+    with timings.measure("ocr_clahe_ar"):
+        ar_b = _recognize_text(clahe_boxes, ocr_model_ar)
 
     with timings.measure("decision"):
         return _ocr_decide(top_class, text_a, text_b, ar_a, ar_b, keywords, keywords_ar, size_specs)
@@ -667,6 +752,12 @@ def classify_crop(crop_img, processor, dino_model, catalog,
         "top_score": 0.0,
         "margin": 0.0,
         "scoring_mode": "sku_head" if sku_head is not None else "cosine_fallback",
+        # Per-stage diagnostic trail for the frontend's "why was this crop
+        # classified this way" sidebar -- one entry per stage the crop
+        # actually reached, in cascade order, so the UI can render every
+        # stage and mark whichever ones never ran as "not reached" once the
+        # cascade stopped earlier.
+        "steps": [],
     }
 
     with timings.measure("embed"):
@@ -674,13 +765,31 @@ def classify_crop(crop_img, processor, dino_model, catalog,
 
     with timings.measure("gate"):
         valid_prob = reject_gate_score(embedding, reject_gate)
-    if valid_prob is not None and valid_prob < REJECT_GATE_THRESHOLD:
+    reject_active = reject_gate is not None
+    reject_passed = valid_prob >= REJECT_GATE_THRESHOLD if reject_active else None
+    row["steps"].append({
+        "stage": "reject_gate",
+        "active": reject_active,
+        "passed": reject_passed,
+        "score": valid_prob,
+        "threshold": REJECT_GATE_THRESHOLD if reject_active else None,
+    })
+    if reject_active and not reject_passed:
         row["decision"] = REJECT
         return row
 
     with timings.measure("gate"):
         bp_prob = bp_target_gate_score(embedding, bp_gate)
-    if bp_prob is not None and bp_prob < BP_TARGET_GATE_THRESHOLD:
+    bp_active = bp_gate is not None
+    bp_passed = bp_prob >= BP_TARGET_GATE_THRESHOLD if bp_active else None
+    row["steps"].append({
+        "stage": "bp_gate",
+        "active": bp_active,
+        "passed": bp_passed,
+        "score": bp_prob,
+        "threshold": BP_TARGET_GATE_THRESHOLD if bp_active else None,
+    })
+    if bp_active and not bp_passed:
         row["decision"] = NON_TARGET
         return row
 
@@ -692,6 +801,7 @@ def classify_crop(crop_img, processor, dino_model, catalog,
         with timings.measure("match"):
             top_class, top_score, margin, _ = sku_head_predict(embedding, sku_head, catalog)
         passes = top_score >= EXACT_SKU_THRESHOLD and margin >= MARGIN_FLOOR
+        match_threshold = EXACT_SKU_THRESHOLD
     else:
         with timings.measure("match"):
             top_class, top_score, margin, _ = cosine_fallback_predict(embedding)
@@ -705,10 +815,21 @@ def classify_crop(crop_img, processor, dino_model, catalog,
             top_score >= COSINE_FALLBACK_THRESHOLD
             and margin >= COSINE_FALLBACK_MARGIN
         )
+        match_threshold = COSINE_FALLBACK_THRESHOLD
 
     row["top_class"] = top_class
     row["top_score"] = top_score
     row["margin"] = margin
+    row["steps"].append({
+        "stage": "sku_head",
+        "active": True,
+        "mode": row["scoring_mode"],
+        "passed": passes,
+        "top_class": top_class,
+        "score": top_score,
+        "margin": margin,
+        "threshold": match_threshold,
+    })
 
     if not passes:
         score_too_low = (
@@ -727,6 +848,12 @@ def classify_crop(crop_img, processor, dino_model, catalog,
     verified_class, *_ = ocr_verify(
         crop_img, top_class, ocr_model_en, ocr_model_ar, keywords, keywords_ar, size_specs, timings
     )
+    row["steps"].append({
+        "stage": "ocr",
+        "active": True,
+        "passed": verified_class is not None,
+        "matched_class": verified_class,
+    })
 
     if verified_class is None:
         row["decision"] = UNKNOWN
@@ -749,7 +876,8 @@ def process_shelf_image(image_bytes, on_progress=None):
     percent reflects work actually completed, not a simulated/timed guess.
 
     Returns {
-        "detections": [{"decision", "matched_class", "bbox": (x1,y1,x2,y2), "score"}, ...],
+        "detections": [{"decision", "matched_class", "bbox": (x1,y1,x2,y2), "score",
+                        "steps": [...per-stage diagnostic trail...]}, ...],
         "image_width": int, "image_height": int, "timings": timing.Timings,
     }
     """
@@ -771,6 +899,22 @@ def process_shelf_image(image_bytes, on_progress=None):
     ocr_model_en = load_ocr_model_en()
     ocr_model_ar = load_ocr_model_ar()
 
+    timings.modes = {
+        "detect": f"YOLO detector -- {os.path.basename(WEIGHTS_PATH)}",
+        "embed": "DINOv3 backbone (frozen) -- same either way",
+        "gate": (
+            f"reject gate {'ACTIVE (trained MLP, threshold ' + str(REJECT_GATE_THRESHOLD) + ')' if reject_gate is not None else 'INACTIVE -- file missing, no crop is ever rejected here'}; "
+            f"BP target gate {'ACTIVE (trained LogReg, threshold ' + str(BP_TARGET_GATE_THRESHOLD) + ')' if bp_gate is not None else 'INACTIVE -- file missing, no crop is ever dropped here'}"
+        ),
+        "classify": (
+            f"32-class SKU head ACTIVE (trained MLP, threshold {EXACT_SKU_THRESHOLD}) -- the guide's real classifier"
+            if sku_head is not None else
+            f"SKU head INACTIVE -- falling back to cosine match vs the Postgres reference gallery (threshold {COSINE_FALLBACK_THRESHOLD})"
+        ),
+        "verify": "OCR: EN + AR branches, consensus = OR across bicubic/CLAHE variants (unchanged by the gate)",
+        "decide": "standard EXACT_SKU / UNKNOWN / REJECT / NON_TARGET rules (unchanged by the gate)",
+    }
+
     _report(15, "detecting products")
     crop_imgs, crop_boxes, width, height = run_detection(image_bytes, timings)
 
@@ -787,6 +931,7 @@ def process_shelf_image(image_bytes, on_progress=None):
             "matched_class": row["matched_class"],
             "bbox": box,
             "score": row["top_score"],
+            "steps": row["steps"],
         })
         if total:
             _report(20 + int(75 * (i + 1) / total), f"classifying crop {i + 1} of {total}")

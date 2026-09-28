@@ -10,13 +10,21 @@ import { useState } from "react";
 // the full, untruncated label, and every other box dims out of the way so
 // you can check it against the underlying photo without the rest of the
 // shelf's clutter. Clicking empty canvas clears the selection.
+//
+// Selection is a controlled/uncontrolled hybrid: pass `selected`+`onSelect`
+// to let a parent (e.g. Preview, which needs to know the selection to drive
+// a diagnostics sidebar) own the state; omit both and this component just
+// tracks it internally, as thumbnail-only callers (ImageList) already do.
 const STRIPES =
   "linear-gradient(to bottom, transparent 32%, rgba(0,0,0,0.06) 32%, rgba(0,0,0,0.06) 33%, transparent 33%, transparent 65%, rgba(0,0,0,0.06) 65%, rgba(0,0,0,0.06) 66%, transparent 66%)";
 
 const DIM_OPACITY = 0.35;
 
-export default function ShelfCanvas({ boxes, height, aspectRatio, showLabels, imageUrl, imageWidth, imageHeight }) {
-  const [selected, setSelected] = useState(null);
+export default function ShelfCanvas({ boxes, height, aspectRatio, showLabels, imageUrl, imageWidth, imageHeight, selected: selectedProp, onSelect }) {
+  const [internalSelected, setInternalSelected] = useState(null);
+  const isControlled = selectedProp !== undefined;
+  const selected = isControlled ? selectedProp : internalSelected;
+  const setSelected = isControlled ? (onSelect || (() => {})) : setInternalSelected;
   const ratio = imageUrl && imageWidth && imageHeight ? `${imageWidth} / ${imageHeight}` : aspectRatio;
 
   return (

@@ -72,6 +72,7 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS images_status_idx ON images(status);
         CREATE INDEX IF NOT EXISTS images_created_at_idx ON images(created_at DESC);
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS timings JSONB;
 
         CREATE TABLE IF NOT EXISTS image_files (
             image_id TEXT PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
@@ -91,6 +92,7 @@ def init_db():
             y2 INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS detections_image_id_idx ON detections(image_id);
+        ALTER TABLE detections ADD COLUMN IF NOT EXISTS diagnostics JSONB;
 
         CREATE TABLE IF NOT EXISTS reference_embeddings (
             id SERIAL PRIMARY KEY,
@@ -156,16 +158,34 @@ def save_image_result(image_id, filename, image_bytes, content_type, image_width
     psycopg2.extras.execute_values(
         cur,
         """INSERT INTO detections
-           (image_id, class_name, decision, score, x1, y1, x2, y2)
+           (image_id, class_name, decision, score, x1, y1, x2, y2, diagnostics)
            VALUES %s""",
         [
-            (image_id, d["matched_class"], d["decision"], d["score"], *d["bbox"])
+            (image_id, d["matched_class"], d["decision"], d["score"], *d["bbox"],
+             psycopg2.extras.Json(d.get("steps", [])))
             for d in detections
         ],
     )
     conn.commit()
     _release(conn)
     return get_image(image_id)
+
+
+def save_image_timings(image_id, timings):
+    """Persists the whole-image per-stage duration summary (seconds per
+    guide stage + total) built in main.py once the request is fully done --
+    a separate UPDATE, not part of save_image_result, because the total
+    (and the DB-save duration itself) aren't known until after that insert
+    already ran. Powers the Preview page's idle-state timing panel, so a
+    reopened image shows real processing time, not just right after upload."""
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE images SET timings = %s WHERE id = %s",
+        (psycopg2.extras.Json(timings), image_id),
+    )
+    conn.commit()
+    _release(conn)
 
 
 def _row_to_summary(row):
@@ -180,13 +200,14 @@ def _row_to_summary(row):
         "verified_count": row["verified_count"],
         "unknown_count": row["unknown_count"],
         "created_at": row["created_at"].isoformat(),
+        "timings": row["timings"],
     }
 
 
 def _detections_for(conn, image_id):
     cur = conn.cursor()
     cur.execute(
-        "SELECT class_name, decision, score, x1, y1, x2, y2 FROM detections WHERE image_id = %s ORDER BY id",
+        "SELECT class_name, decision, score, x1, y1, x2, y2, diagnostics FROM detections WHERE image_id = %s ORDER BY id",
         (image_id,),
     )
     rows = cur.fetchall()
@@ -197,6 +218,7 @@ def _detections_for(conn, image_id):
             "score": r["score"],
             "bbox": [r["x1"], r["y1"], r["x2"], r["y2"]],
             "color": class_color(r["class_name"]),
+            "steps": r["diagnostics"] or [],
         }
         for r in rows
     ]
